@@ -1,0 +1,18 @@
+{
+  "name": "package-history",
+  "version": "1.0.0",
+  "description": "Package history",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mptasinski/package-history.git"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "bin": {
+    "package-history": "index.js"
+  },
+  "author": "",
+  "license": "ISC"
+}
