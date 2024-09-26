@@ -1,174 +1,156 @@
 #!/usr/bin/env node
 
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
+const glob = require('glob');
+const { Command } = require('commander');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
 
-function extractArgs() {
-    const args = process.argv.slice(2);
+const program = new Command();
 
-    if (args.length < 1) {
-        console.error('Error: Missing package name argument.');
-        process.exit(1);
-    }
+program
+    .requiredOption('-f, --files <pattern>', 'Glob pattern to specify target files, e.g., "**/package.json"')
+    .requiredOption('-k, --keyword <word>', 'Keyword to search for within the files, e.g., "lodash"')
+    .option('-o, --output <file>', 'Path to save the output as a CSV file');
 
-    const [packageName, outputFile, packageJSON, repoPath] = args;
+program.parse(process.argv);
 
-    return {
-        packageName,
-        outputFile: outputFile || 'output.json',
-        packageJSON: packageJSON || 'package.json',
-        repoPath: repoPath || ''
-    };
-}
+const options = program.opts();
+const { files: filePattern, keyword, output } = options;
 
-// Helper function to execute Git commands
-function runGitCommand(command, repoPath = '') {
-    return new Promise((resolve, reject) => {
-        exec(command, { cwd: repoPath || process.cwd() }, (error, stdout, stderr) => {
-            if (error) {
-                reject(new Error(stderr || error.message));
-            } else {
-                resolve(stdout);
-            }
-        });
-    });
-}
-
-function saveOutputToFile(output, outputFile) {
-    return new Promise((resolve, reject) => {
-        fs.writeFile(outputFile, JSON.stringify(output, null, 2), 'utf8', (error) => {
-            if (error) {
-                reject(error);
-            } else {
-                resolve();
-            }
-        })
-    });
-}
-
-function extractPackageFromFile(fileContent, packageName) {
+/**
+ * Fetches all commits that modified files matching the file pattern.
+ * @param {string} filePattern - Glob pattern for target files.
+ * @returns {Promise<Array<{hash: string, date: string}>>}
+ */
+async function getCommits(filePattern) {
     try {
-        const packageJson = JSON.parse(fileContent);
-
-        if (packageJson.dependencies && packageJson.dependencies[packageName]) {
-            return packageJson.dependencies[packageName];
-        }
-
-        if (packageJson.devDependencies && packageJson.devDependencies[packageName]) {
-            return packageJson.devDependencies[packageName];
-        }
-
-    } catch {
-        return null;
-    }
-}
-
-function dedupeByVersion(output) {
-    const deduped = [];
-    const seenVersions = new Set();
-
-    for (const entry of output) {
-        if (!seenVersions.has(entry.packageVersion)) {
-            deduped.push(entry);
-            seenVersions.add(entry.packageVersion);
-        }
-    }
-
-    return deduped;
-}
-
-async function findPackageVersion(packageJSON, packageName, repoPath) {
-    try {
-        const repoDir = repoPath ? path.resolve(repoPath) : process.cwd();
-
-        // Verify that the specified file exists in the repository
-        try {
-            await runGitCommand(`git ls-files --error-unmatch "${packageJSON}"`, repoDir);
-        } catch {
-            console.error(`Error: The file "${packageJSON}" does not exist in the repository.`);
-            process.exit(1);
-        }
-
-
-        // Fetch the commit history for the specified file
-        const gitLogCommand = `git log --pretty=format:"%H %ad" --date=short -- "${packageJSON}"`;
-        const gitLogOutput = await runGitCommand(gitLogCommand, repoDir);
-
-        if (!gitLogOutput.trim()) {
-            console.log(`No commits found for the file: ${packageJSON}`);
-            process.exit(0);
-        }
-
-        const commits = gitLogOutput.trim().split('\n').map(line => {
-            const [hash, date] = line.split(' ');
+        // Use git log to get commits that modified files matching the pattern
+        // Git doesn't support glob patterns directly in log, so we use '**/pattern'
+        const cmd = `git log --pretty=format:"%H|%ad" --date=iso -- ${filePattern}`;
+        const { stdout } = await execAsync(cmd, { maxBuffer: 1024 * 1024 * 10 }); // Increase buffer for large outputs
+        const commits = stdout.split('\n').filter(line => line.trim() !== '').map(line => {
+            const [hash, ...dateParts] = line.split('|');
+            const date = dateParts.join('|').trim();
             return { hash, date };
         });
-
-        console.log(`Found ${commits.length} commits for the file: ${packageJSON}`);
-
-        // Extract base filename and extension
-        const outputVersionLog = [];
-
-        // Iterate over each commit and extract the file version
-        for (const commit of commits) {
-            const { hash, date } = commit;
-
-            // Fetch the file content at the specific commit
-            const gitShowCommand = `git show ${hash}:"${packageJSON}"`;
-            try {
-                const fileContent = await runGitCommand(gitShowCommand, repoDir);
-                const packageVersion = extractPackageFromFile(fileContent, packageName);
-                if (packageVersion) {
-                    outputVersionLog.push({ hash, date, packageVersion });
-                }
-            } catch (error) {
-                console.error(`Failed to extract file at commit ${hash}: ${error.message}`);
-            }
-        }
-
-        console.log('File history extraction complete.');
-        return dedupeByVersion(outputVersionLog);
+        return commits;
     } catch (error) {
-        console.error(`An error occurred: ${error.message}`);
+        console.error('Error fetching commits:', error.stderr || error.message);
         process.exit(1);
     }
 }
 
-function findAllPackageJSONFiles(repoPath, packageJSON) {
-    return new Promise((resolve, reject) => {
-        exec(`git ls-files --error-unmatch "${packageJSON}"`, { cwd: repoPath || process.cwd() }, (error, stdout, stderr) => {
-            if (error) {
-                reject(new Error(stderr || error.message));
-            } else {
-                resolve(stdout.trim().split('\n'));
-            }
+/**
+ * Fetches files modified in a specific commit that match the file pattern.
+ * @param {string} commitHash - Commit hash.
+ * @param {string} filePattern - Glob pattern for target files.
+ * @returns {Promise<Array<string>>}
+ */
+async function getFilesInCommit(commitHash, filePattern) {
+    try {
+        const cmd = `git diff-tree --no-commit-id --name-only -r ${commitHash}`;
+        const { stdout } = await execAsync(cmd);
+        const allFiles = stdout.split('\n').filter(file => file.trim() !== '');
+        const matchedFiles = allFiles.filter(file => {
+            return glob.hasMagic(filePattern) ? glob.sync(filePattern, { cwd: process.cwd(), matchBase: true }).includes(file) : file === filePattern;
         });
-    });
+        return matchedFiles;
+    } catch (error) {
+        console.error(`Error fetching files for commit ${commitHash}:`, error.stderr || error.message);
+        return [];
+    }
 }
 
-async function main({ packageName, outputFile, packageJSON, repoPath }) {
-    const repoDir = repoPath ? path.resolve(repoPath) : process.cwd();
-    const packageJSONFiles = await findAllPackageJSONFiles(repoDir, packageJSON);
-
-    if (packageJSONFiles.length === 0) {
-        console.error('No package.json files found in the repository.');
-        process.exit(1);
+/**
+ * Retrieves lines containing the keyword from a file at a specific commit.
+ * @param {string} commitHash - Commit hash.
+ * @param {string} filePath - Path to the file.
+ * @param {string} keyword - Keyword to search for.
+ * @returns {Promise<Array<string>>}
+ */
+async function getKeywordLines(commitHash, filePath, keyword) {
+    try {
+        const cmd = `git show ${commitHash}:${filePath}`;
+        const { stdout } = await execAsync(cmd);
+        const lines = stdout.split('\n').filter(line => line.includes(keyword));
+        return lines;
+    } catch (error) {
+        // File might not exist in this commit or other errors
+        return [];
     }
-
-    const output = [];
-
-    for (const packageJSON of packageJSONFiles) {
-        console.log(`Extracting history for: ${packageJSON}`);
-        const history = await findPackageVersion(packageJSON, packageName, repoDir, `${packageJSON}_${outputFile}`);
-
-        output.push({ packageJSON, history });
-    }
-
-    await saveOutputToFile(output, outputFile);
-
 }
+
+/**
+ * Processes all commits to find keyword occurrences.
+ * @param {Array<{hash: string, date: string}>} commits - List of commits.
+ * @param {string} filePattern - Glob pattern for target files.
+ * @param {string} keyword - Keyword to search for.
+ * @returns {Promise<Array<{filename: string, date: string, line: string}>>}
+ */
+async function processCommits(commits, filePattern, keyword) {
+    const results = [];
+
+    for (const [index, commit] of commits.entries()) {
+        console.log(`Processing commit ${index + 1}/${commits.length}: ${commit.hash}`);
+
+        const files = await getFilesInCommit(commit.hash, filePattern);
+
+        for (const file of files) {
+            const lines = await getKeywordLines(commit.hash, file, keyword);
+            lines.forEach(line => {
+                results.push({
+                    filename: file,
+                    date: commit.date,
+                    line: line.trim(),
+                });
+            });
+        }
+    }
+
+    return results;
+}
+
+/**
+ * Outputs the results either to a CSV file or to the console.
+ * @param {Array<{filename: string, date: string, line: string}>} results - List of results.
+ * @param {string} [outputPath] - Path to the output CSV file.
+ */
+function outputResults(results, outputPath) {
+    if (outputPath) {
+        // Prepare CSV header
+        const header = 'Filename,Date,Line\n';
+        const csvLines = results.map(r => {
+            // Escape double quotes by doubling them
+            const safeLine = r.line.replace(/"/g, '""');
+            return `"${r.filename}","${r.date}","${safeLine}"`;
+        });
+        const csvContent = header + csvLines.join('\n');
+        fs.writeFileSync(outputPath, csvContent, 'utf8');
+        console.log(`\nResults saved to ${outputPath}`);
+    } else {
+        // Print to console
+        results.forEach(r => {
+            console.log(`File: ${r.filename}`);
+            console.log(`Date: ${r.date}`);
+            console.log(`Line: ${r.line}`);
+            console.log('---');
+        });
+    }
+}
+
+/**
+ * Main execution function.
+ */
 (async () => {
-    const args = extractArgs();
-    await main(args);
+    console.log(`Tracking keyword "${keyword}" in files matching "${filePattern}"...\n`);
+    const commits = await getCommits(filePattern);
+    console.log(`Found ${commits.length} commits modifying the specified files.\n`);
+
+    const results = await processCommits(commits, filePattern, keyword);
+    console.log(`\nFound ${results.length} occurrences of the keyword "${keyword}".\n`);
+
+    outputResults(results, output);
 })();
